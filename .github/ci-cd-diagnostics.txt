@@ -1,0 +1,102 @@
+Диагностика CI/CD
+
+Статус: минимальный локальный патч подготовлен, GitHub Actions не запускался.
+Ниже приведены реальные локальные ошибки и выводы из конфигурации.
+Они не являются логами GitHub Actions. Для отчёта по циклу отладки
+нужно добавить ссылки на runs и 20–40 строк реальных логов вокруг каждой
+ошибки (или полный лог шага, если он короче).
+
+1. Setup Node.js / npm cache — .github/workflows/ci-cd.yml:24
+Контекст: actions/setup-node@v4, node-version: 20, cache: npm.
+До: cache-dependency-path: package-locks.json
+После: cache-dependency-path: package-lock.json
+Первопричина по конфигурации: package-locks.json отсутствует, существующий
+lock-файл называется package-lock.json. Сообщение ошибки из GitHub пока
+не получено; нельзя выдавать предполагаемый текст ошибки за реальный лог.
+Симптом: настройка кеша не может использовать указанный lock-файл,
+последующие шаги CI не выполняются при падении Setup Node.js.
+Проверка: существование package-lock.json подтверждено; в GitHub убедиться,
+что Setup Node.js и Install dependencies прошли успешно.
+
+2. Run lint — .github/workflows/ci-cd.yml:30
+Контекст: npm-скрипт запускается из корня репозитория после npm ci.
+До: run: npm run lint:ci
+После: run: npm run lint
+Реальный локальный лог команды npm run lint:ci (основная ошибка):
+  npm error Missing script: "lint:ci"
+  npm error
+  npm error To see a list of scripts, run:
+  npm error   npm run
+Первопричина: в package.json есть scripts.lint, но нет scripts.lint:ci.
+Симптом: Run lint падает до запуска линтера, тесты и сборка пропускаются.
+Проверка: npm run lint в составе npm run verify вывел Lint passed.
+
+3. Smoke check build output — .github/workflows/ci-cd.yml:40
+Контекст: scripts/build.mjs копирует src/*.js в dist/ с исходными именами.
+До: run: node dist/main.js
+После: run: node dist/index.js
+Реальный локальный лог команды node dist/main.js:
+  node:internal/modules/cjs/loader:1433
+    throw err;
+    ^
+  Error: Cannot find module 'D:\user\downloads\pz\cb\dist\main.js'
+      at Function._resolveFilename (node:internal/modules/cjs/loader:1430:15)
+      at defaultResolveImpl (node:internal/modules/cjs/loader:1040:19)
+      at resolveForCJSWithHooks (node:internal/modules/cjs/loader:1045:22)
+      at Function._load (node:internal/modules/cjs/loader:1216:25)
+      at wrapModuleLoad (node:internal/modules/cjs/loader:254:19)
+      at Function.executeUserEntryPoint [as runMain] (node:internal/modules/run_main:171:5)
+      at node:internal/main/run_main_module:36:49 {
+    code: 'MODULE_NOT_FOUND',
+    requireStack: []
+  }
+  Node.js v22.23.2
+Первопричина: сборка создаёт dist/index.js, файла dist/main.js нет.
+Симптом: smoke check падает после успешной сборки, artifact не загружается.
+Проверка: node dist/index.js вывел sum(2, 3) = 5 и завершился с кодом 0.
+
+4. Deploy — .github/workflows/ci-cd.yml:68,71
+Контекст: download-artifact скачивает web-dist в path: artifact.
+До: run: bash scripts/deploy.sh artifacts deploy/staging
+После: run: bash scripts/deploy.sh artifact deploy/staging
+Реальный локальный лог ошибочной команды (Git Bash):
+  Artifact directory not found: artifacts
+Первопричина: параметр artifacts не совпадает с каталогом artifact.
+Симптом: deploy.sh завершает работу до копирования файлов.
+Проверка: dist скопирован в artifact; исправленная команда в Git Bash
+вывела Deployment finished: deploy/staging; SHA-256 всех файлов сборки
+совпали с SHA-256 соответствующих файлов в deploy/staging.
+Это проверка скрипта и пути, а не реальной передачи GitHub artifact.
+
+Шаг Run tests с working-directory: test оставлен без изменений:
+npm находит package.json родительского проекта и выполняет npm-скрипт
+из его корня. Локальная команда npm run test:ci из test/ прошла все 3 теста.
+
+Шаблон запроса к ИИ для каждого реального падения
+  Контекст: событие PR/push, имя job и шага, SHA коммита, ссылка на run.
+  Лог: вставьте 20–40 строк вокруг первой технической ошибки.
+  Workflow: вставьте соответствующий блок из файла на этом SHA.
+  Запрос: назови первопричину и симптомы, предложи минимальный патч
+  только инфраструктуры и способ проверки; не меняй src/ и test/,
+  не добавляй секреты и не скрывай ошибки.
+
+Завершение задания на GitHub
+1. Создайте отдельную ветку. Существующие изменения README и удаления
+   эталонных файлов не включайте в коммиты этого решения.
+2. Для строгого цикла с первым упавшим PR сначала закоммитьте только эти
+   два текстовых файла: исходный workflow в HEAD всё ещё содержит ошибки,
+   а его исправления пока находятся в рабочей копии. Push и открытие PR
+   запустят исходный workflow. Сохраните ссылку и лог Setup Node.js.
+3. Переносите правки workflow отдельными коммитами через git add -p:
+   lock-файл, lint, smoke check. После каждого push дождитесь run,
+   сохраните лог следующей ошибки и заполните запрос к ИИ.
+   Если git объединит соседние правки в один hunk, используйте s (split).
+4. Правку Deploy можно включить отдельным коммитом, но этот шаг в PR
+   не запускается: job имеет условие push в main. Для реального цикла
+   диагностики CD требуется разрешённый push/merge в main и доступ к
+   environment staging; после merge проверьте отдельный запуск CD.
+5. Проверьте последний run на последнем SHA PR: CI должен иметь Success,
+   CD (staging) будет Skipped по текущему условию. Сверьте с фактическим
+   списком обязательных проверок в настройках репозитория.
+6. Дополните отчёт ссылками на runs, реальными логами и итоговым статусом;
+   только после этого можно заявлять выполнение критерия Success в PR.
